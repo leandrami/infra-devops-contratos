@@ -25,6 +25,22 @@ jobs:
       - run: npm run build
       - run: npm test
 
+  validate-infra:
+    name: Validar manifestos K8s e Compose
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Instalar kubeconform
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz
+          sudo mv kubeconform /usr/local/bin/
+      - name: Validar manifestos Kubernetes
+        run: kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.29.0 k8s/
+      - name: Validar docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config -q
+
   docker:
     name: Build, scan e push da imagem
     needs: test

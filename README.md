@@ -5,7 +5,7 @@ Infraestrutura, automação e entrega contínua para a API de Contratos (Node.js
 ## Visão geral
 
 ```
-Dev ──push──▶ GitHub ──▶ GitHub Actions (test ▶ build ▶ scan ▶ push GHCR ▶ deploy)
+Dev ──push──▶ GitHub ──▶ GitHub Actions (segredos ∥ testes ∥ SAST ∥ IaC ▶ build ▶ Trivy ▶ Docker Hub ∥ DAST ∥ Terraform)
                                                    │
                          ┌─────────────────────────┴───────────────┐
                          ▼                                         ▼
@@ -22,14 +22,15 @@ Dev ──push──▶ GitHub ──▶ GitHub Actions (test ▶ build ▶ scan
 | `Dockerfile` / `.dockerignore` | Imagem multi-stage, enxuta, usuário não-root, HEALTHCHECK |
 | `docker-compose.yml` | Ambiente completo local com healthchecks e monitoramento |
 | `.env.example` | Modelo de variáveis (o `.env` real não é versionado) |
-| `.github/workflows/ci-cd.yml` | Pipeline: testes → build → scan → push → deploy |
+| `.github/workflows/ci-cd.yml` | Pipeline DevSecOps: segredos, testes, SAST, IaC, imagem, DAST e Terraform |
+| `terraform/` | Infraestrutura como código (9 recursos) para o LocalStack |
 | `k8s/*.yaml` | Manifestos: namespace, config, banco, cache, API, HPA, ingress |
 | `monitoring/` | Prometheus e Grafana provisionados como código |
 | `Makefile` | Atalhos de operação |
 
 ## Pré-requisitos
 
-Docker + Docker Compose v2, Git, e (opcional) `kubectl` + minikube/kind para a parte de Kubernetes.
+Docker + Docker Compose v2, Git e Terraform. Opcional: `kubectl` + minikube/kind (parte extra de Kubernetes).
 
 ## Execução local (Docker Compose)
 
@@ -44,26 +45,55 @@ Serviços: API `http://localhost:3000` · Prometheus `http://localhost:9090` · 
 
 ## Testando a API
 
-Rotas existentes: `POST /contracts`, `GET /metrics`, `GET /health`.
+Rotas existentes: `POST /contracts`, `GET /metrics` e `GET /health`. Campos do contrato: `title` e `userId` são obrigatórios; `description` e `value` são opcionais.
 
 ```bash
+# 1) saúde e métricas
 curl -i http://localhost:3000/health
 curl -s http://localhost:3000/metrics | head
+
+# 2) criar um contrato (esperado: HTTP 201 e "Contract created successfully")
 curl -i -X POST http://localhost:3000/contracts \
   -H "Content-Type: application/json" \
-  -d '{ "...campos da entidade Contract..." }'
-curl -s http://localhost:3000/metrics | grep -i contract   # métricas após a requisição
+  -d '{"title":"Contrato de prestação de serviços","userId":"user-1","description":"Contrato de teste","value":1500.50}'
+
+# 3) validação (esperado: HTTP 400, faltou o userId)
+curl -i -X POST http://localhost:3000/contracts \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Contrato sem usuário"}'
+
+# 4) conferir no banco
+docker compose exec postgres sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT * FROM contracts;"'
 ```
 
 Testes unitários: `npm ci && npm test`.
 
 > As tabelas são criadas automaticamente (`synchronize: true` no TypeORM). Em produção real o ideal é usar migrations.
 
-## Deploy em Kubernetes (minikube/kind)
+## Infraestrutura como código (Terraform + LocalStack)
+
+O diretório `terraform/` descreve, em código, 9 recursos de uma AWS simulada pelo LocalStack (sem custo): VPC, sub-rede, internet gateway, tabela de rotas, associação de rota, security group (firewall), instância EC2, bucket S3 e versionamento do bucket. A EC2 é simulada; os containers da aplicação rodam via Docker Compose.
+
+```bash
+# requer Terraform instalado
+docker compose --profile iac up -d localstack
+curl -s http://localhost:4566/_localstack/health   # serviços "available"
+cd terraform
+terraform init
+terraform apply -auto-approve                      # 9 recursos criados
+terraform output
+```
+
+Atalhos: `make tf-up` e `make tf-down` (remove tudo com `terraform destroy`). O estado local (`.tfstate`) não vai para o Git.
+
+## Extra (opcional): Kubernetes (minikube/kind)
+
+Não faz parte da pipeline; mostra como a mesma imagem rodaria em um cluster.
+
 
 ```bash
 minikube start && minikube addons enable ingress && minikube addons enable metrics-server
-# ajuste a imagem em k8s/api.yaml (ghcr.io/<usuario>/<repo>)
+# ajuste a imagem em k8s/api.yaml (<usuario-dockerhub>/<repo>)
 export DB_PASSWORD='senha-forte'
 make k8s-up
 kubectl -n contratos get pods
@@ -73,11 +103,23 @@ curl http://contratos.local/health
 
 Remover tudo: `make k8s-down`.
 
-## Pipeline CI/CD
+## Pipeline CI/CD (DevSecOps)
 
-- **Pull Request:** instala, compila, roda testes e valida o build da imagem.
-- **Push na `main`:** além disso, publica a imagem no GHCR (tag = SHA do commit e `latest`), faz scan Trivy e faz deploy com rolling update.
-- Secret necessário no GitHub: `KUBE_CONFIG` (kubeconfig em base64). O `GITHUB_TOKEN` já é automático.
+A cada push na `main` (e em pull requests), o GitHub Actions executa:
+
+| Etapa | Ferramenta | O que faz |
+|---|---|---|
+| Segredos | Gitleaks | Procura credenciais vazadas no código e no histórico |
+| Testes | Node.js + Jest | Compila (`tsc`) e roda os testes |
+| SAST | Semgrep | Análise estática do código-fonte |
+| Scan de IaC | Checkov | Verifica Dockerfile, Terraform e manifestos |
+| Imagem | Docker + Trivy | Build, scan de vulnerabilidades e push no Docker Hub (tags SHA e `latest`) |
+| DAST | OWASP ZAP | Ataque simulado contra a API em execução |
+| Infraestrutura | Terraform + LocalStack | Cria 9 recursos numa AWS simulada |
+
+**Secrets do GitHub** (*Settings → Secrets and variables → Actions*): `DOCKERHUB_USERNAME` e `DOCKERHUB_TOKEN` (token de acesso criado no Docker Hub). Sem eles, a imagem é construída e analisada, mas não publicada, e a pipeline continua verde.
+
+Gitleaks, testes e Terraform bloqueiam a pipeline se falharem. SAST, Checkov, Trivy e DAST funcionam em modo relatório: mostram os achados sem bloquear.
 
 ## Justificativa de arquitetura
 
@@ -94,6 +136,12 @@ Remover tudo: `make k8s-down`.
 **Segurança.** Contêiner não-root, sem escalada de privilégios, limites de CPU/memória; credenciais fora do código (`.env` ignorado, Kubernetes Secrets, GitHub Secrets); banco e Redis expostos apenas na rede interna; scan de vulnerabilidades no pipeline.
 
 **Observabilidade.** O `/metrics` da API alimenta o Prometheus e o Grafana (provisionados como código), permitindo acompanhar latência, taxa de requisições e erros.
+
+**Infraestrutura como código (Terraform).** A infraestrutura de nuvem também é código: o mesmo `terraform apply` gera sempre o mesmo ambiente, e cada mudança fica registrada e revisável no Git. O LocalStack permite validar tudo sem custo.
+
+**Segurança integrada ao pipeline (DevSecOps).** A segurança é verificada a cada push, antes de o código ir para o ar: Gitleaks (segredos), Semgrep (SAST), Checkov (IaC), Trivy (imagem) e OWASP ZAP (DAST, com a API rodando). Problemas aparecem cedo, quando custam pouco para corrigir.
+
+**Entrega por imagem versionada.** A imagem é publicada no Docker Hub com a tag `latest` e o SHA do commit, o que mostra exatamente qual alteração gerou cada versão e permite voltar a uma versão anterior.
 
 ## Limitações e melhorias futuras
 
